@@ -1,13 +1,13 @@
 #!/bin/sh
 
 # install-unifi.sh
-# Installs the Uni-Fi controller software on a FreeBSD machine or FreeBSD Jail running on FreeNAS.
+# Installs the Uni-Fi controller software on a FreeBSD machine (presumably running pfSense).
 
 # The latest version of UniFi:
-UNIFI_SOFTWARE_URL="https://dl.ubnt.com/unifi/7.3.83/UniFi.unix.zip"
+UNIFI_SOFTWARE_URL="https://dl.ui.com/unifi/7.3.83/UniFi.unix.zip"
 
 # The rc script associated with this branch or fork:
-RC_SCRIPT_URL="https://raw.githubusercontent.com/TechButton/unifi-controller-freebsd-freenas/master/rc.d/unifi.sh"
+RC_SCRIPT_URL="https://raw.githubusercontent.com/gozoinks/unifi-pfsense/master/rc.d/unifi.sh"
 
 # If pkg-ng is not yet installed, bootstrap it:
 if ! /usr/sbin/pkg -N 2> /dev/null; then
@@ -21,6 +21,15 @@ if ! /usr/sbin/pkg -N 2> /dev/null; then
   echo "ERROR: pkgng installation failed. Exiting."
   exit 1
 fi
+
+# Determine this installation's Application Binary Interface
+ABI=`/usr/sbin/pkg config abi`
+
+# FreeBSD package source:
+FREEBSD_PACKAGE_URL="https://pkg.freebsd.org/${ABI}/latest/All/"
+
+# FreeBSD package list:
+FREEBSD_PACKAGE_LIST_URL="https://pkg.freebsd.org/${ABI}/latest/packagesite.txz"
 
 # Stop the controller if it's already running...
 # First let's try the rc script if it exists:
@@ -43,6 +52,9 @@ if [ $(ps ax | grep -c "/usr/local/UniFi/data/[d]b") -ne 0 ]; then
   /bin/kill -15 `ps ax | grep "/usr/local/UniFi/data/[d]b" | awk '{ print $1 }'`
   echo " done."
 fi
+
+# Repairs Mongodb database in case of corruption
+mongod --dbpath /usr/local/UniFi/data/db --repair
 
 # If an installation exists, we'll need to back up configuration:
 if [ -d /usr/local/UniFi/data ]; then
@@ -69,10 +81,99 @@ echo -n "Mounting new filesystems..."
 /sbin/mount -a
 echo " done."
 
+
+#remove mongodb34 - discontinued
+echo "Removing packages discontinued..."
+if [ `pkg info | grep -c mongodb-` -eq 1 ]; then
+        pkg unlock -yq mongodb
+	env ASSUME_ALWAYS_YES=YES /usr/sbin/pkg delete mongodb
+fi
+
+if [ `pkg info | grep -c mongodb34-` -eq 1 ]; then
+        pkg unlock -yq mongodb34 
+	env ASSUME_ALWAYS_YES=YES /usr/sbin/pkg delete mongodb34
+fi
+
+if [ `pkg info | grep -c mongodb36-` -eq 1 ]; then
+        pkg unlock -yq mongodb36
+	env ASSUME_ALWAYS_YES=YES /usr/sbin/pkg delete mongodb36
+fi
+echo " done."
+
+
+
+
 # Install mongodb, OpenJDK, and unzip (required to unpack Ubiquiti's download):
 # -F skips a package if it's already installed, without throwing an error.
 echo "Installing required packages..."
-env ASSUME_ALWAYS_YES=YES /usr/sbin/pkg install mongodb openjdk8 unzip pcre v8 snappy
+#uncomment below for pfSense 2.2.x:
+#env ASSUME_ALWAYS_YES=YES /usr/sbin/pkg install mongodb openjdk unzip pcre v8 snappy
+
+fetch ${FREEBSD_PACKAGE_LIST_URL}
+tar vfx packagesite.txz
+
+AddPkg () {
+ 	pkgname=$1
+        pkg unlock -yq $pkgname
+ 	pkginfo=`grep "\"name\":\"$pkgname\"" packagesite.yaml`
+ 	pkgvers=`echo $pkginfo | pcregrep -o1 '"version":"(.*?)"' | head -1`
+
+	# compare version for update/install
+ 	if [ `pkg info | grep -c $pkgname-$pkgvers` -eq 1 ]; then
+	     echo "Package $pkgname-$pkgvers already installed."
+	else
+	     env ASSUME_ALWAYS_YES=YES /usr/sbin/pkg add -f ${FREEBSD_PACKAGE_URL}${pkgname}-${pkgvers}.txz
+
+	     # if update openjdk8 then force detele snappyjava to reinstall for new version of openjdk
+	     if [ "$pkgname" == "openjdk8" ]; then
+	          pkg unlock -yq snappyjava
+	          env ASSUME_ALWAYS_YES=YES /usr/sbin/pkg delete snappyjava
+             fi
+        fi
+        pkg lock -yq $pkgname
+}
+
+#Add the following Packages for installation or reinstallation (if something was removed)
+AddPkg png
+AddPkg freetype2
+AddPkg fontconfig
+AddPkg alsa-lib
+AddPkg mpdecimal
+AddPkg python37
+AddPkg libfontenc
+AddPkg mkfontscale
+AddPkg dejavu
+AddPkg giflib
+AddPkg xorgproto
+AddPkg libXdmcp
+AddPkg libpthread-stubs
+AddPkg libXau
+AddPkg libxcb
+AddPkg libICE
+AddPkg libSM
+AddPkg libX11
+AddPkg libXfixes
+AddPkg libXext
+AddPkg libXi
+AddPkg libXt
+AddPkg libXtst
+AddPkg libXrender
+AddPkg libinotify
+AddPkg javavmwrapper
+AddPkg java-zoneinfo
+AddPkg openjdk8
+AddPkg snappyjava
+AddPkg snappy
+AddPkg cyrus-sasl
+AddPkg icu
+AddPkg boost-libs
+AddPkg mongodb40
+AddPkg unzip
+AddPkg pcre
+
+# Clean up downloaded package manifest:
+rm packagesite.*
+
 echo " done."
 
 # Switch to a temp directory for the Unifi download:
@@ -94,6 +195,27 @@ echo -n "Updating mongod link..."
 /bin/ln -sf /usr/local/bin/mongod /usr/local/UniFi/bin/mongod
 echo " done."
 
+# If partition size is < 4GB, add smallfiles option to mongodb
+echo -n "Checking partition size..."
+if [ `df -k | awk '$NF=="/"{print $2}'` -le 4194302 ]; then
+	echo -e "\nunifi.db.extraargs=--smallfiles\n" >> /usr/local/UniFi/data/system.properties
+fi
+echo " done."
+
+# Replace snappy java library to support AP adoption with latest firmware:
+echo -n "Updating snappy java..."
+unifizipcontents=`zipinfo -1 UniFi.unix.zip`
+upstreamsnappyjavapattern='/(snappy-java-[^/]+\.jar)$'
+# Make sure exactly one match is found
+if [ $(echo "${unifizipcontents}" | egrep -c ${upstreamsnappyjavapattern}) -eq 1 ]; then
+  upstreamsnappyjava="/usr/local/UniFi/lib/`echo \"${unifizipcontents}\" | pcregrep -o1 ${upstreamsnappyjavapattern}`"
+  mv "${upstreamsnappyjava}" "${upstreamsnappyjava}.backup"
+  cp /usr/local/share/java/classes/snappy-java.jar "${upstreamsnappyjava}"
+  echo " done."
+else
+  echo "ERROR: Could not locate UniFi's snappy java! AP adoption will most likely fail"
+fi
+
 # Fetch the rc script from github:
 echo -n "Installing rc script..."
 /usr/bin/fetch -o /usr/local/etc/rc.d/unifi.sh ${RC_SCRIPT_URL}
@@ -114,14 +236,9 @@ fi
 # Restore the backup:
 if [ ! -z "${BACKUPFILE}" ] && [ -f ${BACKUPFILE} ]; then
   echo "Restoring UniFi data..."
-  mv /usr/local/UniFi/data /usr/local/UniFi/data-orig
+  mv /usr/local/UniFi/data /usr/local/UniFi/data-`date +%Y%m%d-%H%M`
   /usr/bin/tar -vxzf ${BACKUPFILE} -C /
 fi
-#TODO - *Need to verify the current version of snappyjava*
-echo "Install snappy java" 
-env ASSUME_ALWAYS_YES=YES /usr/sbin/pkg install snappyjava
-/bin/mv /usr/local/UniFi/lib/snappy-java-1.1.2.6.jar  snappy-java-1.1.2.6.jar.bak
-/bin/ln -s /usr/local/share/java/classes/snappy-java.jar  /usr/local/UniFi/lib/snappy-java-1.1.2.6.jar
 
 # Start it up:
 echo -n "Starting the unifi service..."
